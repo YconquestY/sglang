@@ -1,6 +1,6 @@
 # SGLang + DeepGEMM Mega MoE Research
 
-This note is based on the local source trees on 2026-04-18:
+This note is based on the local source trees on 2026-04-19:
 
 - `deepgemm` HEAD = `7f2a703` (`[Public release 26/04] Introducing Mega MoE, FP4 Indexer and other features/fixes`)
 - `sglang` local checkout in `/home/yy010/proj/sglang`
@@ -16,16 +16,23 @@ DeepGEMM Mega MoE is a different abstraction boundary:
 - it expects **raw token inputs + global top-k routing**
 - it requires **FP8 activations + FP4 weights**, **symmetric memory**, and **Blackwell**
 
-Because of that, the correct integration is **not** to extend `DeepGemmRunnerCore` in `sglang`. The correct integration is to add a **new MoE backend path** that lets DeepGEMM Mega MoE own the entire MoE forward inside the NVLink domain.
+The most important numerical point is that DeepGEMM Mega MoE's FP4 contract is **not** SGLang's current `modelopt_fp4` contract:
 
-The cleanest `sglang` shape is:
+- DeepGEMM Mega MoE uses FP4 E2M1 weights with **packed UE8M0 scales** and `gran_k = 32`
+- `sglang`'s `modelopt_fp4` path is **NVFP4** with **FP8-E4M3 scales** and block size `16`
+
+So a native `deep_gemm_mega + modelopt_fp4` design is wrong.
+
+The correct native landing zone in `sglang` is:
 
 - add a new runner backend, e.g. `deep_gemm_mega`
 - use `MoeA2ABackend.NONE` + `StandardDispatcher`
 - preserve **global** expert ids in the standard dispatch path
 - register a fused op `@register_fused_func("none", "deep_gemm_mega")`
-- call DeepGEMM Mega MoE directly from that fused op
+- integrate it through `python/sglang/srt/layers/quantization/mxfp4.py`
 - keep the existing DeepEP / grouped-GEMM / FlashInfer paths as fallback
+
+For NVFP4 checkpoints, this serving path should do **no** runtime or load-time transcoding. If NVFP4 support is needed, the checkpoint must be converted to a Mega-compatible MXFP4 form **offline before serving**.
 
 ## 1. How `sglang` Uses DeepGEMM Today
 
@@ -65,22 +72,15 @@ So the current DeepGEMM integration is:
 - **combine outside DeepGEMM**
 - **two GEMMs inside DeepGEMM**
 
-### 1.3 Current backend selection is tied to FP8 MoE
+### 1.3 Current backend selection is tied to existing FP8 / non-Mega paths
 
-Relevant logic is in:
+Relevant logic is currently spread across:
 
 - `python/sglang/srt/layers/quantization/fp8.py`
+- `python/sglang/srt/layers/quantization/modelopt_quant.py`
+- `python/sglang/srt/layers/quantization/mxfp4.py`
 
-`Fp8MoEMethod.create_moe_runner()` auto-selects `MoeRunnerBackend.DEEP_GEMM` when:
-
-- the MoE backend is `auto` or explicitly `deep_gemm`
-- DeepGEMM is available
-- the MoE A2A backend is `deepep`, `mooncake`, or `nixl`
-
-This is a stale DeepGEMM use case relative to Mega MoE:
-
-- current path is **FP8 MoE**
-- Mega MoE is **FP8 activations + FP4 weights**
+None of these paths currently expose Mega MoE as an end-to-end backend.
 
 ## 2. DeepGEMM Mega MoE Kernel Interface
 
@@ -141,7 +141,7 @@ From `deep_gemm/mega/__init__.py`, `csrc/apis/mega.hpp`, and `tests/test_mega_mo
 - `l1_weights`: local expert FP4 packed weights + scale tensor
 - `l2_weights`: local expert FP4 packed weights + scale tensor
 
-DeepGEMM’s own test fills the buffer per call:
+DeepGEMM's own test fills the buffer per call:
 
 ```python
 buffer.x[:num_tokens].copy_(x_fp8)
@@ -150,17 +150,42 @@ buffer.topk_idx[:num_tokens].copy_(topk_idx)
 buffer.topk_weights[:num_tokens].copy_(topk_weights)
 ```
 
-### 2.4 Weight transform requirements
+### 2.4 Mega MoE's FP4 numerical contract is MXFP4-like, not NVFP4
+
+DeepGEMM SM100 FP4 uses:
+
+- FP4 E2M1 payloads
+- packed **UE8M0** scales (`torch.int` on the Python side)
+- `gran_k = 32`
+
+This is visible in:
+
+- `deep_gemm/utils/math.py`
+- `tests/test_mega_moe.py`
+- `csrc/apis/mega.hpp`
+- `README.md`
+
+So the native Mega contract is much closer to `sglang`'s `mxfp4` path than to `modelopt_fp4`.
+
+By contrast, `sglang` `modelopt_fp4` is explicitly NVFP4:
+
+- E2M1 weights
+- FP8-E4M3 weight scales
+- block size `16`
+
+That mismatch is fundamental enough that `modelopt_fp4` should not be the native Mega integration target.
+
+### 2.5 Weight transform requirements
 
 `transform_weights_for_mega_moe()` is not cosmetic. It changes layout:
 
 - L1 (`gate+up`) is interleaved in gate/up chunks of 8
 - L1 scales are transposed into the UTCCP-required layout
-- L2 scales are also transposed into UTCCP-required layout
+- L2 scales are also transposed into the UTCCP-required layout
 
-So `sglang` cannot just pass its current FP4 expert tensors directly.
+So `sglang` cannot just pass its current backend-specific MoE expert tensors directly.
 
-### 2.5 Hard constraints
+### 2.6 Hard constraints
 
 Mega MoE currently assumes:
 
@@ -179,9 +204,9 @@ Mega MoE currently assumes:
 
 The buffer allocator also aligns `num_max_tokens_per_rank` to the internal `block_m`.
 
-### 2.6 Mega MoE is full MoE forward, not a GEMM primitive
+### 2.7 Mega MoE is full MoE forward, not a GEMM primitive
 
-DeepGEMM’s README describes Mega MoE as fusing:
+DeepGEMM's README describes Mega MoE as fusing:
 
 - EP dispatch
 - linear 1
@@ -191,7 +216,7 @@ DeepGEMM’s README describes Mega MoE as fusing:
 
 That is the key interface fact for `sglang`: Mega MoE wants to start from **raw local tokens + global routing**, not from an already-dispatched token buffer.
 
-## 3. How `sglang` Implements MoE Forward Today
+## 3. How `sglang` Implements MoE Forward and Quantization Today
 
 ### 3.1 High-level forward path
 
@@ -212,36 +237,7 @@ So `sglang` is architected around:
 - moe core
 - combiner
 
-### 3.2 Expert-parallel dispatchers
-
-Dispatcher creation is in:
-
-- `python/sglang/srt/layers/moe/fused_moe_triton/layer.py:create_moe_dispatcher`
-
-Important cases:
-
-- `MoeA2ABackend.NONE` -> `StandardDispatcher`
-- `DEEPEP` / `MOONCAKE` / `NIXL` -> DeepEP-class dispatcher
-
-The DeepEP dispatcher returns either:
-
-- `DeepEPNormalDispatchOutput`
-- `DeepEPLLDispatchOutput`
-
-from:
-
-- `python/sglang/srt/layers/moe/token_dispatcher/deepep.py`
-
-### 3.3 Current DeepEP path already performs communication before the runner
-
-For low-latency mode, `deepep.py` calls:
-
-- `buffer.low_latency_dispatch(...)`
-- later `buffer.low_latency_combine(...)`
-
-So if `sglang` first enters DeepEP low-latency dispatch and then calls Mega MoE, communication has already happened and the Mega kernel cannot deliver its intended overlap.
-
-### 3.4 Standard dispatcher is the right no-op path
+### 3.2 `StandardDispatcher` is the right no-op path
 
 `StandardDispatcher` in:
 
@@ -252,19 +248,57 @@ normally just forwards:
 - raw `hidden_states`
 - `topk_output`
 
-For some backends, it intentionally preserves **global expert ids** and lets the runner own EP internally. Today this is already done for backends such as:
+For some backends, it intentionally preserves **global expert ids** and lets the runner own EP internally. That pattern matches DeepGEMM Mega MoE much better than the current DeepEP dispatcher path.
 
-- `flashinfer_cutlass`
-- `flashinfer_cutedsl`
-- `flashinfer_trtllm_routed`
+### 3.3 `modelopt_quant.py` is not the universal MoE quantization entry point
 
-That pattern matches DeepGEMM Mega MoE much better than the current DeepEP dispatcher path.
+The real abstraction is the shared quantization interface in:
+
+- `python/sglang/srt/layers/quantization/base_config.py`
+
+`FusedMoE` asks the selected quantization config for a quantization method, then calls:
+
+- `create_weights()`
+- `create_moe_runner()`
+- `apply()`
+
+Both of these are first-class implementations of that interface:
+
+- `python/sglang/srt/layers/quantization/modelopt_quant.py`
+- `python/sglang/srt/layers/quantization/mxfp4.py`
+
+So landing Mega in `mxfp4.py` is not a workaround. It is the native place if Mega's numerical contract matches MXFP4.
+
+### 3.4 `modelopt_fp4` is NVFP4-only
+
+`modelopt_quant.py` explicitly treats ModelOpt FP4 as NVFP4:
+
+- supported ModelOpt formats are `FP8` and `NVFP4`
+- NVFP4 weights use FP8-E4M3 scales
+- NVFP4 block size is `16`
+
+That makes `ModelOptNvFp4FusedMoEMethod` the wrong native integration point for Mega.
+
+### 3.5 `mxfp4.py` is the better native fit
+
+`mxfp4.py` already defines:
+
+- `Mxfp4Config`
+- `Mxfp4MoEMethod`
+
+and integrates with `FusedMoE` through the same `create_weights()` / `create_moe_runner()` / `apply()` contract as every other quantization path.
+
+The key fit is:
+
+- it is already the MXFP4-specific MoE implementation
+- it already owns MoE weight preparation and runner selection
+- its weight/scaling contract is block-32 MXFP4-like, which is much closer to DeepGEMM Mega than NVFP4 is
 
 ## 4. What This Means for Integration
 
-## 4.1 Do not integrate Mega MoE into `DeepGemmRunnerCore`
+### 4.1 Do not integrate Mega MoE into `DeepGemmRunnerCore`
 
-This is the wrong place because `DeepGemmRunnerCore` assumes:
+This is still the wrong place because `DeepGemmRunnerCore` assumes:
 
 - dispatch already happened
 - combine will happen later outside the runner
@@ -275,7 +309,7 @@ If you plug Mega MoE there, you either:
 - duplicate communication, or
 - bypass the intended overlap and reduce Mega MoE to a worse abstraction
 
-## 4.2 The clean integration shape is a new EP-owning runner backend
+### 4.2 The clean integration shape is a new EP-owning runner backend
 
 Recommended shape:
 
@@ -293,38 +327,51 @@ Why this is the right fit:
 
 This is exactly the same architectural pattern `sglang` already uses for backends that own EP internally.
 
-## 4.3 The first target should be FP4 MoE, not current FP8 DeepGEMM MoE
+### 4.3 The first native target should be `mxfp4`, not `modelopt_fp4`
 
-Mega MoE is an **FP8xFP4** kernel.
+Mega MoE is an **FP8xFP4** kernel, but not every FP4 flavor is equivalent.
 
-Therefore the integration should target an FP4 MoE quantization path, not:
+The first native integration target should therefore be:
 
-- `Fp8MoEMethod`
-- `DeepGemmRunnerCore`
+- `Mxfp4MoEMethod`
+- in `python/sglang/srt/layers/quantization/mxfp4.py`
 
-The closest existing control-plane landing zone in `sglang` is:
+and explicitly **not**:
 
 - `ModelOptNvFp4FusedMoEMethod`
+- `python/sglang/srt/layers/quantization/modelopt_quant.py`
 
 Reason:
 
-- it already owns FP4 expert weights
-- it already plugs into `MoeRunner`
-- it already supports backends that own EP internally via fused funcs
+- `mxfp4.py` is already a first-class quantization path in `sglang`
+- its numerical contract is much closer to DeepGEMM Mega's FP4 contract
+- it already owns MoE weight preparation and `MoeRunner` integration
 
-This is an inference from the code structure, but it is the cleanest existing fit.
+### 4.4 No serving-time transcoding
 
-## 4.4 Add a DeepGEMM-specific transformed weight copy
+For this integration, `sglang` should do **no** numerical transcoding from NVFP4 to MXFP4 during serving:
+
+- no runtime per-batch conversion
+- no load-time dequantize / requantize inside `sglang`
+
+If an NVFP4 checkpoint needs to be used with Mega MoE, the model must be converted **offline before startup** into a Mega-compatible MXFP4 checkpoint.
+
+So the serving integration should either:
+
+- accept native / preconverted MXFP4 checkpoints, or
+- reject the checkpoint with a clear error
+
+### 4.5 Add a DeepGEMM-specific transformed weight cache on the MXFP4 path
 
 Do not try to reuse backend-specific swizzled weights from:
 
-- FlashInfer TRTLLM
-- FlashInfer CuteDSL
-- existing blockscale-swizzled tensors
+- FlashInfer MXFP4
+- Triton MXFP4
+- existing backend-specific layout transforms
 
-DeepGEMM Mega MoE needs its own transformed representation:
+DeepGEMM Mega MoE still needs its own transformed representation:
 
-- original FP4 packed local expert weights
+- local expert FP4 packed weights in the DeepGEMM-expected view
 - DeepGEMM-specific scale layout
 - L1 gate/up interleave expected by `transform_weights_for_mega_moe()`
 
@@ -332,9 +379,10 @@ So the implementation should maintain a dedicated DeepGEMM-Mega cache, e.g.:
 
 - `layer.deepgemm_mega_l1_weight`
 - `layer.deepgemm_mega_l2_weight`
-- maybe lazily built on first use
 
-## 4.5 Activation handling
+This cache should be built from the native MXFP4 checkpoint tensors by **layout repacking only**, not by numerical dequantize / requantize.
+
+### 4.6 Activation handling
 
 `sglang` MoE config uses:
 
@@ -355,13 +403,13 @@ The activation path should:
 
 The likely reusable helper on the `sglang` side is its existing FP8 quantization path used for DeepGEMM / Blackwell-compatible activations.
 
-## 4.6 Suggested control flow in `sglang`
+### 4.7 Suggested control flow in `sglang`
 
 Recommended fast path:
 
 1. `FusedMoE.forward_impl()` uses `StandardDispatcher` because `moe_a2a_backend == none`.
 2. `StandardDispatcher` does **not** remap expert ids to local ids for `deep_gemm_mega`.
-3. `ModelOptNvFp4FusedMoEMethod` (or a dedicated DeepGEMM-Mega MoE method) creates `DeepGemmMegaMoeQuantInfo`.
+3. `Mxfp4MoEMethod` creates `DeepGemmMegaMoeQuantInfo`.
 4. `@register_fused_func("none", "deep_gemm_mega")`:
    - quantizes activations to FP8 + UE8M0 scale
    - lazily allocates / reuses a symmetric buffer
@@ -373,7 +421,7 @@ Recommended fast path:
 
 ## 5. Concrete `sglang` Touch Points
 
-If I were implementing this, I would start with these files:
+If I were implementing this revised design, I would start with these files:
 
 - `python/sglang/srt/layers/moe/utils.py`
   - add `MoeRunnerBackend.DEEP_GEMM_MEGA`
@@ -391,10 +439,11 @@ If I were implementing this, I would start with these files:
   - define `DeepGemmMegaMoeQuantInfo`
   - register `@register_fused_func("none", "deep_gemm_mega")`
 
-- `python/sglang/srt/layers/quantization/modelopt_quant.py`
+- `python/sglang/srt/layers/quantization/mxfp4.py`
   - create / cache transformed DeepGEMM-Mega weights
   - instantiate `MoeRunner(MoeRunnerBackend.DEEP_GEMM_MEGA, ...)`
   - package the quant info
+  - reject non-native checkpoints instead of transcoding them
 
 - optionally `python/sglang/srt/server_args.py`
   - expose a backend string if you want a first-class CLI knob
@@ -403,11 +452,13 @@ If I were implementing this, I would start with these files:
 
 - Do not route Mega MoE through `DeepEPDispatcher`.
 - Do not extend the current `DeepGemmRunnerCore` grouped-GEMM path.
+- Do not enable it for `modelopt_fp4` / NVFP4.
+- Do not do runtime transcoding.
+- Do not do load-time transcoding inside `sglang`.
 - Do not enable it for multi-node / RDMA EP.
 - Do not enable it for non-Blackwell GPUs.
 - Do not enable it for non-gated activations.
-- Do not enable it for arbitrary quantization methods on day 1.
-- Do not assume existing FlashInfer weight swizzles are reusable.
+- Do not assume existing FlashInfer / Triton weight swizzles are reusable.
 
 ## 7. Practical Rollout Recommendation
 
@@ -417,25 +468,30 @@ I would implement V1 with the following guardrails:
 - only for:
   - CUDA
   - Blackwell
-  - EP world size > 1
+  - `quantization == mxfp4`
+  - `ep_size == tp_size`
+  - `ep_size > 1`
+  - `moe_a2a_backend == none`
   - single NVLink domain
-  - FP4 MoE quantization path
   - gated SiLU / SwiGLU
+- reject NVFP4 checkpoints unless they were preconverted offline before serving
 - fallback to existing backend otherwise
 
-This gives you a narrow, correct first integration that matches DeepGEMM Mega MoE’s real interface instead of forcing it into the old grouped-GEMM design.
+This gives you a narrow, correct first integration that matches DeepGEMM Mega MoE's real interface instead of forcing it into the old grouped-GEMM design or into the wrong FP4 numerical format.
 
 ## 8. Bottom Line
 
 The main conclusion is:
 
 - **Mega MoE should be integrated as a new backend that owns EP internally**
-- **not** as an extension of `sglang`’s current DeepGEMM grouped-GEMM runner
+- **not** as an extension of `sglang`'s current DeepGEMM grouped-GEMM runner
+- **and not** as a native `modelopt_fp4` backend
 
 In `sglang` terms, the right mental model is:
 
 - architecturally closer to `flashinfer_cutedsl` / EP-owning fused backends
-- numerically and kernel-wise driven by DeepGEMM’s FP8xFP4 Mega MoE contract
+- numerically and kernel-wise driven by DeepGEMM's FP8xFP4 Mega MoE contract
+- natively aligned with `sglang`'s `mxfp4` path, not its NVFP4 ModelOpt path
 - operationally limited to single-node Blackwell NVLink domains
 
-That is the cleanest way to make `sglang` consume the new DeepGEMM Mega MoE kernel without fighting the kernel’s actual interface.
+That is the cleanest way to make `sglang` consume the new DeepGEMM Mega MoE kernel without fighting the kernel's actual interface or introducing serving-time transcoding.
