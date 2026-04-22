@@ -13,6 +13,7 @@
 - `python/sglang/srt/layers/moe/moe_runner/runner.py`: treat Mega as a fused-only backend (`runner_core = None`).
 - `python/sglang/srt/layers/deep_gemm_wrapper/configurer.py`: expose Mega capability detection.
 - `python/sglang/srt/layers/deep_gemm_wrapper/entrypoint.py`: add thin wrappers for the Mega APIs.
+- `python/sglang/srt/layers/quantization/fp8_kernel.py`: fix the shared UE8M0 activation-scale packing path so `group_size=32` produces the packed layout Mega actually expects.
 - `python/sglang/srt/layers/quantization/mxfp4.py`: load native MXFP4 weights, build the DeepGEMM-specific layout cache, set up the runner, and add the Mega branch in `apply()`.
 - New module `python/sglang/srt/layers/moe/moe_runner/deep_gemm_mega.py`: fused op, runtime cache, and lazy symmetric-buffer creation.
 
@@ -24,6 +25,7 @@
   - `python/sglang/srt/layers/moe/moe_runner/runner.py`
   - `python/sglang/srt/layers/deep_gemm_wrapper/configurer.py`
   - `python/sglang/srt/layers/deep_gemm_wrapper/entrypoint.py`
+  - `python/sglang/srt/layers/quantization/fp8_kernel.py`
   - `python/sglang/srt/layers/quantization/mxfp4.py`
 - Create:
   - `python/sglang/srt/layers/moe/moe_runner/deep_gemm_mega.py`
@@ -50,6 +52,11 @@
 - `deep_gemm_wrapper/entrypoint.py`:
   - Add wrappers `get_symm_buffer_for_mega_moe(...)`, `transform_weights_for_mega_moe(...)`, and `fp8_fp4_mega_moe(...)`.
   - V1 does not touch `compile_utils.py`; accept first-use JIT latency.
+- `fp8_kernel.py`:
+  - Keep the Mega call site unchanged: `sglang_per_token_group_quant_fp8(group_size=32, column_major_scales=True, scale_tma_aligned=True, scale_ue8m0=True)`.
+  - Fix the shared `scale_ue8m0=True` output-shape/layout logic to derive packed scale width from `group_size`, not from a hardcoded `128`.
+  - Preserve the existing column-major / TMA-aligned contract; for Mega the visible scale tensor shape must be `[num_tokens, hidden / 128]` because 4 group-32 scales are packed into each `torch.int32`.
+  - Remove the implicit `group_size == 128` assumption from the fallback path so the helper contract is consistent even when the Triton fallback is exercised.
 - `Mxfp4MoEMethod.create_moe_runner()`:
   - Import `sglang.srt.layers.moe.moe_runner.deep_gemm_mega` when Mega is selected so `@register_fused_func("none", "deep_gemm_mega")` is registered.
 - `Mxfp4MoEMethod.process_weights_after_loading()`:
@@ -63,7 +70,7 @@
   - `@dataclass DeepGemmMegaMoeRuntime`: store `symm_buffer`, `max_num_tokens`, `device_group`, and cached transformed weights.
   - `@dataclass DeepGemmMegaMoeQuantInfo(MoeQuantInfo)`: carry the runtime object.
   - `ensure_deep_gemm_mega_runtime(layer)`: lazily allocate the symmetric buffer with `get_moe_ep_group().device_group` and `get_symm_buffer_for_mega_moe(...)`; size it with `max(cuda_graph_max_bs or 512, chunked_prefill_size or 8192)`; create it under `torch.inference_mode(False)`; no dynamic grow in V1.
-  - `fused_experts_none_to_deep_gemm_mega_mxfp4(...)`: quantize activations with `sglang_per_token_group_quant_fp8(group_size=32, column_major_scales=True, scale_tma_aligned=True, scale_ue8m0=True)`, convert `topk_ids` to `int64` and `topk_weights` to `float32`, copy `x/x_sf/topk` into the symmetric buffer every forward, call `fp8_fp4_mega_moe(...)` with recipe `(1, 1, 32)` and activation `"swiglu"`, and return `StandardCombineInput(hidden_states=output)`.
+  - `fused_experts_none_to_deep_gemm_mega_mxfp4(...)`: quantize activations with `sglang_per_token_group_quant_fp8(group_size=32, column_major_scales=True, scale_tma_aligned=True, scale_ue8m0=True)`, convert `topk_ids` to `int64` and `topk_weights` to `float32`, assert the packed activation scale tensor matches the symmetric-buffer view shape/dtype, copy `x/x_sf/topk` into the symmetric buffer every forward, call `fp8_fp4_mega_moe(...)` with recipe `(1, 1, 32)` and activation `"swiglu"`, and return `StandardCombineInput(hidden_states=output)`.
 - `Mxfp4MoEMethod.apply()`:
   - Add a Mega branch before the existing FlashInfer / Triton MXFP4 branches.
   - Call `ensure_deep_gemm_mega_runtime(layer)`, wrap it in `DeepGemmMegaMoeQuantInfo`, and dispatch through `self.runner.run(...)`.
@@ -77,6 +84,9 @@
   - `Mxfp4MoEMethod.process_weights_after_loading()` creates `_deep_gemm_mega_l1_weights/_l2_weights` once per layer.
   - The Mega cache is built by layout repacking only; no dequantize / requantize path is exercised.
   - Cached weights have the expected shapes/dtypes, `w13` is interleaved, and scales match the DeepGEMM layout requirements.
+- Activation-quantization coverage:
+  - `sglang_per_token_group_quant_fp8(group_size=32, column_major_scales=True, scale_tma_aligned=True, scale_ue8m0=True)` returns `torch.float8_e4m3fn` activations plus `torch.int32` packed scales with visible shape `[num_tokens, hidden / 128]`.
+  - The packed activation scales match DeepGEMM's `per_token_cast_to_fp8(..., gran_k=32, use_packed_ue8m0=True)` convention after layout normalization.
 - Fused backend functional coverage in `test/registered/moe/test_deep_gemm_mega_mxfp4.py`:
   - `fused_experts_none_to_deep_gemm_mega_mxfp4()` matches a direct `deep_gemm.fp8_fp4_mega_moe()` call on the same synthetic inputs/topk metadata.
   - Include an EP>1 case to verify global expert ids are preserved and consumed correctly.
@@ -92,5 +102,6 @@
 - V1 scope is `mxfp4` on Blackwell only, with BF16 output and standard-path dispatch only.
 - V1 assumes a single NVLink domain; no cross-node EP support.
 - V1 always uses runtime FP8 activation quantization, DeepGEMM recipe `(1, 1, 32)`, and maps SGLang `silu` to DeepGEMM `swiglu`.
+- V1 keeps the existing Mega call site shape in `deep_gemm_mega.py`; the activation-quantization fix is in the shared FP8 helper, not in a Mega-only custom quantizer.
 - V1 does not add Mega prewarm support to `compile_utils.py`.
 - V1 does not perform runtime or load-time NVFP4 -> MXFP4 transcoding inside `sglang`; any such conversion must happen offline before startup.

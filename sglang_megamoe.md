@@ -398,10 +398,18 @@ These should be treated as the same effective mode for gated MoE in this integra
 The activation path should:
 
 - quantize `hidden_states` to FP8 E4M3FN
+- quantize activations with per-token **group-32** scaling
 - emit packed UE8M0 scales compatible with DeepGEMM
+- produce `x_sf` with visible shape `[num_tokens, hidden / 128]`, i.e. 4 group-32 scales packed into each `torch.int32`
 - copy both into the symmetric buffer
 
 The likely reusable helper on the `sglang` side is its existing FP8 quantization path used for DeepGEMM / Blackwell-compatible activations.
+
+One important implementation detail for this helper reuse:
+
+- the Mega path should still call `sglang_per_token_group_quant_fp8(group_size=32, column_major_scales=True, scale_tma_aligned=True, scale_ue8m0=True)`
+- but the shared UE8M0 packing path must derive its packed scale width from `group_size`, not from a hardcoded `128`
+- for Mega, this means keeping the existing call shape while making the helper emit packed scales that match DeepGEMM's real activation contract instead of the old group-128 assumption used by the existing DeepGEMM FP8 GEMM path
 
 ### 4.7 Suggested control flow in `sglang`
 
@@ -411,7 +419,7 @@ Recommended fast path:
 2. `StandardDispatcher` does **not** remap expert ids to local ids for `deep_gemm_mega`.
 3. `Mxfp4MoEMethod` creates `DeepGemmMegaMoeQuantInfo`.
 4. `@register_fused_func("none", "deep_gemm_mega")`:
-   - quantizes activations to FP8 + UE8M0 scale
+   - quantizes activations to FP8 + packed UE8M0 scale using the existing FP8 helper with `group_size=32`
    - lazily allocates / reuses a symmetric buffer
    - copies `x`, `x_sf`, `topk_ids`, `topk_weights` into the buffer
    - calls `deep_gemm.fp8_fp4_mega_moe(...)`
@@ -435,9 +443,14 @@ If I were implementing this revised design, I would start with these files:
     - `transform_weights_for_mega_moe`
     - `fp8_fp4_mega_moe`
 
+- `python/sglang/srt/layers/quantization/fp8_kernel.py`
+  - make the shared `scale_ue8m0=True` path pack scales according to the requested `group_size`
+  - preserve the current API and column-major/TMA-aligned contract so Mega can keep using `sglang_per_token_group_quant_fp8(...)` directly
+
 - `python/sglang/srt/layers/moe/moe_runner/deep_gemm_mega.py`
   - define `DeepGemmMegaMoeQuantInfo`
   - register `@register_fused_func("none", "deep_gemm_mega")`
+  - add a local assertion that the quantized activation scale tensor matches the symmetric buffer view before copying
 
 - `python/sglang/srt/layers/quantization/mxfp4.py`
   - create / cache transformed DeepGEMM-Mega weights
@@ -459,6 +472,7 @@ If I were implementing this revised design, I would start with these files:
 - Do not enable it for non-Blackwell GPUs.
 - Do not enable it for non-gated activations.
 - Do not assume existing FlashInfer / Triton weight swizzles are reusable.
+- Do not add a Mega-only ad hoc activation quantizer if the existing FP8 helper can be made group-size-correct with a narrow fix.
 
 ## 7. Practical Rollout Recommendation
 
