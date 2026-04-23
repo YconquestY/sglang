@@ -73,6 +73,26 @@ class TestMoERunner4GPU(CustomTestCase):
             ],
         },
     }
+    if os.environ.get("SGLANG_DEEP_GEMM_MEGA_MOE_MODEL"):
+        CONFIGS["moe_runner_deep_gemm_mega_mxfp4"] = {
+            "model": os.environ["SGLANG_DEEP_GEMM_MEGA_MOE_MODEL"],
+            "other_args": [
+                "--moe-runner-backend",
+                "deep_gemm_mega",
+                "--moe-a2a-backend",
+                "none",
+                "--quantization",
+                "mxfp4",
+                "--tp-size",
+                "4",
+                "--ep-size",
+                "4",
+                "--mem-fraction-static",
+                "0.75",
+                "--model-loader-extra-config",
+                '{"enable_multithread_load": true}',
+            ],
+        }
 
     def _run_config(self, config: dict) -> None:
         model = config["model"]
