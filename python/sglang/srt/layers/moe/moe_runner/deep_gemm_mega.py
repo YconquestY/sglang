@@ -241,6 +241,13 @@ def fused_experts_none_to_deep_gemm_mega_mxfp4(
     topk_weights = topk_output.topk_weights.to(torch.float32)
 
     symm_buffer = runtime.symm_buffer
+    expected_scale_shape = (num_tokens, symm_buffer.x_sf.shape[1])
+    if x_s.dtype != symm_buffer.x_sf.dtype or x_s.shape != expected_scale_shape:
+        raise ValueError(
+            "DeepGEMM Mega MoE expected packed UE8M0 activation scales with "
+            f"shape={expected_scale_shape} and dtype={symm_buffer.x_sf.dtype}, "
+            f"got shape={tuple(x_s.shape)} dtype={x_s.dtype}."
+        )
     symm_buffer.x[:num_tokens].copy_(x_q)
     symm_buffer.x_sf[:num_tokens].copy_(x_s)
     symm_buffer.topk_idx[:num_tokens].copy_(topk_ids)
