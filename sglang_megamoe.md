@@ -509,3 +509,175 @@ In `sglang` terms, the right mental model is:
 - operationally limited to single-node Blackwell NVLink domains
 
 That is the cleanest way to make `sglang` consume the new DeepGEMM Mega MoE kernel without fighting the kernel's actual interface or introducing serving-time transcoding.
+
+## 9. V2 Expansion: MNNVL / IMEX
+
+Keep everything above as the **V1** plan.
+
+For **V2**, the natural expansion target is **not** arbitrary multi-node EP over RDMA. The right expansion target is:
+
+- **one IMEX domain / one NVLink domain**
+- e.g. GB200 NVL72 / MNNVL partitions
+- still using `moe_a2a_backend == none`
+- still letting DeepGEMM Mega own dispatch + compute + combine inside the EP group
+
+### 9.1 Why MNNVL / IMEX is plausible for Mega MoE
+
+DeepGEMM Mega itself does **not** hard-code a single-node assumption:
+
+- it allocates a symmetric buffer with `torch.distributed._symmetric_memory`
+- it rendezvous-es that buffer on the provided process group
+- it passes the peer buffer pointers into the fused mega-kernel
+
+So from DeepGEMM's point of view, the critical requirement is not "single chassis", but:
+
+- the EP group must be able to establish symmetric memory successfully
+- peer GPU memory in that group must be importable / accessible at runtime
+
+That lines up with NVIDIA's MNNVL / IMEX model:
+
+- MNNVL extends the NVLink P2P memory model across compute trays
+- IMEX is the service that enables secure GPU memory export / import and shared-memory-style access across OS domains inside one NVLink domain
+
+It also lines up with PyTorch Symmetric Memory:
+
+- `rendezvous()` accepts either a process group or a group name
+- custom kernels can use peer buffer pointers from the returned handle
+
+So the Mega abstraction boundary still fits. What changes in V2 is the **deployment domain** and the **startup validation**, not the MoE architecture.
+
+### 9.2 What Existing `sglang` Code Already Tells Us
+
+`sglang` already has some MNNVL-aware infrastructure, but it lives in **other** paths:
+
+- FlashInfer MNNVL bootstrap uses a Torch-distributed comm backend wrapper in
+  `python/sglang/srt/layers/moe/token_dispatcher/flashinfer_utils.py`
+- FlashInfer unified comm fusion already carries an aarch64 + sm10x transport workaround for GB systems in
+  `python/sglang/srt/layers/flashinfer_comm_fusion.py`
+- Mooncake disaggregation docs already treat NVLink / MNNVL as a distinct deployment mode
+
+However, none of those components is the Mega MoE runtime path.
+
+Mega currently uses:
+
+- `get_moe_ep_group().device_group`
+- DeepGEMM's own `get_symm_buffer_for_mega_moe(...)`
+- DeepGEMM / PyTorch symmetric memory directly
+
+So V2 should **not** try to route Mega through FlashInfer MNNVL workspaces or through DeepEP. The Mega path stays architecturally the same.
+
+### 9.3 The Main Renovation Needed in `sglang`
+
+The V2 problem is operational correctness, not kernel decomposition.
+
+The main things `sglang` should renovate are:
+
+1. **Make Mega topology-aware**
+
+- V1 assumes the EP group is single-node.
+- V2 should distinguish:
+  - single-node NVLink EP groups
+  - cross-node EP groups that still live inside one IMEX / NVLink domain
+
+`sglang` already has enough distributed metadata to do this:
+
+- `get_moe_ep_group().device_group` is the actual Mega process group
+- `get_moe_ep_group().cpu_group` plus `in_the_same_node_as(...)` can tell whether that group spans multiple OS nodes
+
+2. **Add an explicit MNNVL / IMEX preflight**
+
+For V2, `sglang` should not assume that "cross-node group" automatically means "Mega is safe".
+
+It should fail fast unless the EP group can actually establish the symmetric-memory path required by DeepGEMM Mega.
+
+The preflight should be Mega-specific and should run **before serving traffic**.
+
+Recommended checks:
+
+- the EP group is fully contained inside one IMEX domain / NVLink partition
+- PyTorch symmetric memory can allocate and rendezvous on that EP group
+- the deployment has accessible IMEX channels on every participating node
+
+At minimum, a small `torch.distributed._symmetric_memory.empty(...)` + `rendezvous(...)` probe on the EP group is needed.
+
+A stronger probe for production rollout would be:
+
+- allocate a tiny Mega symmetric buffer on the real EP group
+- optionally run a tiny synthetic Mega forward once
+
+That probe is more valuable than generic topology heuristics because it validates the exact mechanism Mega depends on.
+
+3. **Keep Mega separate from `--enable-symm-mem`**
+
+This is important:
+
+- SGLang's `--enable-symm-mem` flag controls its **NCCL symmetric-memory allocator path**
+- DeepGEMM Mega uses **PyTorch symmetric memory directly**
+
+So V2 should not be framed as "turn on `--enable-symm-mem` and Mega will scale out".
+
+Those are different mechanisms.
+
+`--enable-symm-mem` may still be useful for other collectives in the process, but it is **not** the thing that makes Mega MNNVL-capable.
+
+4. **Add deployment-facing error messages**
+
+If the V2 preflight fails, the error should mention likely MNNVL / IMEX causes directly:
+
+- IMEX service not running / not connected
+- missing `/dev/nvidia-caps-imex-channels/channel*`
+- inconsistent channel assignment across nodes
+- ranks spanning multiple NVLink partitions / IMEX domains
+- PyTorch symmetric-memory stack unsupported in the current driver / PyTorch / CUDA environment
+
+This matters because otherwise the failure will look like an opaque symmetric-memory or permission problem deep inside PyTorch / CUDA.
+
+### 9.4 A Good V2 Scope Boundary
+
+The clean V2 scope is:
+
+- **same backend**: `deep_gemm_mega`
+- **same quantization path**: `mxfp4`
+- **same dispatcher shape**: `StandardDispatcher`
+- **same fused runtime path**: `deep_gemm_mega.py`
+- **expanded deployment domain**: from "single node NVLink" to "single IMEX domain / MNNVL partition"
+
+But it should still **not** include:
+
+- InfiniBand / RoCE / generic RDMA EP
+- multi-domain / multi-partition EP
+- fallback transport layers inside the Mega path
+- rewriting Mega around DeepEP / FlashInfer / Mooncake dispatch
+
+So the V2 mental model is:
+
+- still a fused EP-owning Mega backend
+- still direct symmetric-memory remote access
+- but now across an NVLink network instead of only inside one box
+
+### 9.5 A Note on Symmetric Memory Backend Selection
+
+This is an inference from the sources, not an explicit DeepGEMM requirement:
+
+- Mega consumes peer buffer pointers in a custom kernel
+- it does **not** use NCCL copy-engine collectives on the Mega buffer itself
+
+Because of that, V2 should treat PyTorch symmetric-memory backend selection as an explicit policy decision rather than rely forever on the implicit default.
+
+The most likely correct policy is:
+
+- keep the Mega symmetric buffer on the PyTorch SymmMem path intended for custom peer-access kernels
+- do not redesign the Mega path around NCCL CE collectives
+
+If backend selection becomes user-visible in PyTorch deployments, `sglang` should surface and log the chosen policy for Mega instead of silently inheriting it.
+
+### 9.6 Recommended V2 Rollout Order
+
+I would expand V1 to V2 in this order:
+
+1. add topology detection + a Mega-specific cross-node opt-in
+2. add a symmetric-memory / IMEX preflight on the EP group
+3. add manual MNNVL smoke coverage on a real NVL72 partition
+4. only after that, claim official V2 support for one IMEX domain
+
+That keeps the actual Mega MoE architecture stable while raising the operational bar enough for rack-scale deployment.
