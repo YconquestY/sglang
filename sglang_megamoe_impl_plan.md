@@ -97,6 +97,47 @@
 - Optional manual smoke/perf:
   - Add a Mega config to `test/manual/layers/moe/test_moe_runners_4gpu.py`.
 
+## Testing Instructions
+1. Reserve a 4-GPU Blackwell slice on the same NVLink domain of the GB200 NVL72 tray.
+   - Do not start with all 72 GPUs; the current SGLang integration and checked-in backend tests target `tp=4, ep=4`.
+2. Export the required environment variables.
+   - `export CUDA_VISIBLE_DEVICES=0,1,2,3`
+   - `export SGLANG_ENABLE_JIT_DEEPGEMM=1`
+   - `export SGLANG_JIT_DEEPGEMM_PRECOMPILE=0`
+   - `export SGLANG_DEEP_GEMM_MEGA_MOE_MODEL=/abs/path/to/offline_converted_serialized_mxfp4_moe_ckpt`
+3. Verify the model format before running SGLang.
+   - The checkpoint must already be an offline-converted, serialized MXFP4 MoE checkpoint.
+   - Do not use NVFP4 / `modelopt_fp4`.
+   - Do not rely on dynamic or in-serving MXFP4 quantization.
+4. Sanity-check DeepGEMM Mega MoE by itself.
+   - `cd /home/yy010/proj/deepgemm`
+   - `python3 tests/test_mega_moe.py --num-processes 4 --num-max-tokens-per-rank 512 --hidden 7168 --intermediate-hidden 3072 --num-experts 384 --num-topk 6 --num-correctness-tests 1`
+   - This validates symmetric memory, FP8 activation quantization, FP4 weight layout, and the fused Mega kernel outside SGLang.
+5. Run the SGLang backend validation tests.
+   - `cd /home/yy010/proj/sglang`
+   - `python3 -m pytest test/registered/backends/test_deep_gemm_mega_mxfp4.py -q`
+   - This checks runner registration, server-arg validation, and checkpoint-format rejection.
+6. Run the activation-quantization regression test for the group-32 fix.
+   - `python3 -m pytest test/registered/quant/test_fp8_utils.py -q -k PackedUe8m0ScaleShape`
+   - This confirms that `sglang_per_token_group_quant_fp8(..., group_size=32, scale_ue8m0=True)` returns packed activation scales with visible shape `[num_tokens, hidden / 128]`.
+7. Run the fused Mega MoE unit tests.
+   - `python3 -m pytest test/registered/moe/test_deep_gemm_mega_mxfp4.py -q`
+   - This covers weight preparation, runtime creation, packed-scale validation, top-k copying, and the fused DeepGEMM call path.
+8. Run the manual 4-GPU MoE runner smoke test.
+   - `python3 -m pytest test/manual/layers/moe/test_moe_runners_4gpu.py -q -s -k deep_gemm_mega_mxfp4`
+   - This launches a real SGLang server with the Mega backend and runs a small MMLU smoke eval.
+9. Run the registered end-to-end backend test.
+   - `python3 -m pytest test/registered/backends/test_deep_gemm_mega_mxfp4_moe.py -q -s`
+   - This launches SGLang with `--tp 4 --ep 4 --moe-runner-backend deep_gemm_mega --moe-a2a-backend none --quantization mxfp4 --mem-fraction-static 0.75 --model-loader-extra-config '{"enable_multithread_load": true}'` and then runs GSM8K.
+10. If a manual server bring-up is needed outside pytest, use the exact tested topology first.
+   - `python3 -m sglang.launch_server --model-path "$SGLANG_DEEP_GEMM_MEGA_MOE_MODEL" --tp 4 --ep 4 --moe-runner-backend deep_gemm_mega --moe-a2a-backend none --quantization mxfp4 --mem-fraction-static 0.75 --model-loader-extra-config '{"enable_multithread_load": true}'`
+11. Interpret common failures narrowly.
+   - `supports only: 'mxfp4'` or `offline-converted, serialized mxfp4 checkpoint`: wrong checkpoint format.
+   - `requires ep_size == tp_size and ep_size > 1`: wrong TP/EP topology.
+   - `requires Blackwell + DeepGEMM`: missing hardware capability or missing DeepGEMM Mega support.
+   - `expected packed UE8M0 activation scales`: activation quantization / scale packing path regressed.
+   - `symmetric buffer is too small`: increase `chunked_prefill_size` or `cuda_graph_max_bs`.
+
 ## Assumptions and Defaults
 - V1 is fused-backend only; `moe_runner/deep_gemm.py` and `token_dispatcher/deepep.py` stay unchanged.
 - V1 scope is `mxfp4` on Blackwell only, with BF16 output and standard-path dispatch only.
